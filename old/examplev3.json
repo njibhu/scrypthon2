@@ -1,0 +1,6 @@
+var tableYourStream = {
+	label: "NameYourStream",
+	color: "#FFFFFF",
+	data: [
+	]
+};
