@@ -23,12 +23,16 @@ import os
 # Notes:
 # The parser will (sadly) work only up to 99 millions viewers...
 # SOON TM: implement concurrent process pool
+# For categories: Categoriesid need to be the same order than categories name
+# Categoriesid are channels id, with platform 0. (and platformid doesn't matter)
+# For the catid (which is not the same), 0 is an overall, 1 the first cat etc..
 
 class statd:
 	"""Main class:
 	  - version: script version
-	  - interval: Interval between each count request (in seconds)
-	  - plots: Dictionaries of plots, each corresponding to a tuple (platform, platformid)
+	  - plots: Dictionaries of plots and categories
+			- [x][0] corresponding to a tuple (platform, platformid)
+			- [x][1] corresponding to a list of categories
 	  - db infos: login database infos
 	  - sqlco: link to mysql connector
 	  - sqlcursor: connector cursor
@@ -36,8 +40,7 @@ class statd:
 	
 	#Class builder
 	def __init__(self):
-		self.version = (4,0)
-		self.interval = 60
+		self.version = (4,1)
 		self.plots = {}
 		
 		self.db_login = ""
@@ -53,9 +56,28 @@ class statd:
 		
 		self.updateconf()
 		
+		#Using PID file to avoid multiple daemons
+		if os.path.isfile('gtvstatsd.PID') == False:
+			f = open('gtvstatsd.PID', 'w')
+			f.write(str(os.getpid()))
+			f.close()
+		else:
+			print("Daemon already started")
+			exit()
+
+		
 	def updateconf(self):
-		#List graph, parse ids and link them to channels
-		query = "SELECT id,channelids FROM graphs"
+		"""
+		- interval: Interval between each count request (in seconds) 
+		"""
+		#Get options (interval)
+		query = "SELECT interval FROM options"
+		self.sqlcursor.execute(query)
+		for result in self.sqlcursor:
+			self.interval = result[0]
+		
+		#List graph, parse ids, link them to channels, and categories
+		query = "SELECT id,channelids,catid FROM graphs"
 		self.sqlcursor.execute(query)
 		rows = self.sqlcursor.fetchall()
 		for results in rows:
@@ -67,9 +89,14 @@ class statd:
 				
 				for platform_tuple in self.sqlcursor :
 					channel_list.append(platform_tuple)
-			print(str(results[0]) + str(channel_list))
+			print("Channels:" + str(results[0]) + str(channel_list))
 			#Add the graph to the plot list with all platform infos
-			self.plots[results[0]] = channel_list
+			self.plots[results[0]] = [channel_list]
+			#Working with categories:
+			catlist = []
+			for category in results[2].split(","):
+				catlist.append(category)
+			self.plots[results[0]].append(catlist)
 	
 	def get_twitch(self, streamid): #PLATFORM: 1
 		try:
@@ -87,6 +114,7 @@ class statd:
 		try:
 			streamid = str(streamid)
 			result = str(urllib.request.urlopen("https://api.dailymotion.com/video/" + streamid + "?fields=audience").read())
+			#Parse the audience from result
 			pyFind = re.compile("\d{1,8}")
 			audience = int(re.search(pyFind,result).group())
 		except:
@@ -104,6 +132,18 @@ class statd:
 			audience = 0
 		return audience
 	
+	def commit_category(self):
+		timestamp = int(time.time())
+		query = "SELECT categoriesid FROM options"
+		self.sqlcursor.execute(query)
+		for categories in self.sqlcursor:
+			categories = categories.split(",")
+		
+		for x in range(1, len(categories)+1):
+			query = "INSERT INTO series (timestamp,graphid,count) VALUES (%s, %s, %s)"
+			data = (timestamp, categories, self.categorycount[x])
+			self.sqlcursor.execute(query, data)
+			
 	def update(self, chanid, channel_list):
 		"""
 		Update the selected channel
@@ -111,7 +151,9 @@ class statd:
 		"""
 		viewers = 0
 		for channel in channel_list:
-			if(channel[0] == 1):
+			if(channel[0] == 0):
+				return 0
+			elif(channel[0] == 1):
 				viewers += self.get_twitch(channel[1])
 			elif(channel[0] == 2):
 				viewers += self.get_dailymotion(channel[1])
@@ -124,22 +166,40 @@ class statd:
 		query = "INSERT INTO series (timestamp,graphid,count) VALUES (%s, %s, %s)"
 		data = (timestamp, chanid, viewers)
 		self.sqlcursor.execute(query, data)
+		return viewers
 	
-	#If needed improve this with concurrent library
-	#Definitely next version..
+	def viewver_update(self):
+		#Reset for each new count
+		self.categorycount = {}
+		for channel in self.plots:
+			views = self.update(channel, self.plots[channel][0])
+			#Count for the categories:
+			for cats in self.plots[channel][1]:
+				try:
+					self.categorycount[cats] += views
+				except:
+					self.categorycount[cats] = views
+		
+		#Commit the count to the database
+		self.commit_category()
+		self.sqlco.commit()
+	
+	
+	#Will definitely improve this with concurrent process pool on the next version.
+	#Http request are not handling it asynchronously right now.. network latency could 
+	#cumulate here, but works fine if the number of request/interval is not too high.
 	def tickloop(self):
 		lasttick = 0
-		#We need to use "tick trick" instead of "sleep" to avoid latancy accumulation.
-		#Will change if I implement the process pool...
+		#We need to use "tick trick" instead of sleep(interval) to avoid latancy effect 
+		#on tick time. Will change when process pool will be implemented.
 		refresher = 0
 		while True:
 			tick = int(time.time())
 			if lasttick + self.interval < tick:
-				for channel in self.plots:
-					self.update(channel, self.plots[channel])
+				#That's only this line (down) that needs to be updated with process pool
+				self.viewver_update()
 				lasttick = tick
 				refresher+=1
-				self.sqlco.commit()
 			else: 
 				#Checking new channels
 				if refresher > 5:
@@ -149,31 +209,32 @@ class statd:
 				time.sleep(1)
 	
 if __name__ == '__main__':
-	#Using PID file to avoid multiple daemons
-	if os.path.isfile('gtvstatsd.PID') == False:
-		f = open('gtvstatsd.PID', 'w')
-		f.write(str(os.getpid()))
-		f.close()
-		daemon = statd()
-		daemon.tickloop()
-	else:
-		print("Daemon already started")
+	daemon = statd()
+	daemon.tickloop()
 	
-## SQL DATABASE tvstats
-#CREATE TABLE channels ( ;USED ONLY FOR THE GTVSTAT DAEMON
-#  id INT(8) NOT NULL AUTO_INCREMENT, ;PRIMARY KEY
-#  platform INT(2) NOT NULL, ;SEE UPPER
-#  platformid VARCHAR(40) NOT NULL, ;CHANNEL ID
-#  PRIMARY KEY (id));
-#CREATE TABLE series (
-#  id INT(20) NOT NULL AUTO_INCREMENT,
-#  timestamp INT(20) NOT NULL, ;IN SECONDS
-#  graphid INT(8) NOT NULL, ;SAME ID FOR graph TABLE
-#  count INT(10) NOT NULL, ;VIEWERS COUNT
-#  PRIMARY KEY (id));
-#CREATE TABLE graphs (
-#  id INT(8) NOT NULL AUTO_INCREMENT, ;SEE TABLE series
-#  name VARCHAR(40) NOT NULL, ;NAME SHOWN IN THE WEB GRAPH
-#  texthover VARCHAR(99) NOT NULL, ;TEXT HOVER...
-#  channelids VARCHAR(50) NOT NULL, ;LIST OF channels USED FOR THE COUNT
-#  PRIMARY KEY (id));
+def SQL_DATABASE_TVSTATS():
+	return """
+CREATE TABLE channels ( --USED ONLY FOR THE GTVSTAT DAEMON
+  id INT(8) NOT NULL AUTO_INCREMENT, --PRIMARY KEY
+  platform INT(2) NOT NULL, --SEE UPPER
+  platformid VARCHAR(40) NOT NULL, --CHANNEL ID
+  PRIMARY KEY (id));
+CREATE TABLE series (
+  id INT(20) NOT NULL AUTO_INCREMENT,
+  timestamp INT(20) NOT NULL, --IN SECONDS
+  graphid INT(8) NOT NULL, --SAME ID FOR graph TABLE
+  count INT(10) NOT NULL, --VIEWERS COUNT
+  PRIMARY KEY (id));
+CREATE TABLE graphs (
+  id INT(8) NOT NULL AUTO_INCREMENT, --SEE TABLE series
+  name VARCHAR(40) NOT NULL, --NAME SHOWN IN THE WEB GRAPH
+  texthover VARCHAR(99) NOT NULL, --TEXT HOVER...
+  channelids VARCHAR(50) NOT NULL, --LIST OF channels USED FOR THE COUNT (splits with ,)
+  catid INT(4) NOT NULL, --CATEGORY ID (can be severals): 0 is an overall; 1,2 first second etc..
+  PRIMARY KEY (id));
+CREATE TABLE options (
+  interval INT(5) NOT NULL, ;UPDATE INTERVAL
+  categoriesnames VARCHAR(99) NOT NULL, ;CATEGORIES NAMES (splits with ,)
+  categoriesid VARCHAR(30) NOT NULL, ;CATEGORIES NAMES (splits with ,)
+  );
+"""
